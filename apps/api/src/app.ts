@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import cookieParser from "cookie-parser";
 import cors from "cors";
-import express from "express";
+import express, { type RequestHandler } from "express";
 import helmetImport from "helmet";
+import type { HelmetOptions } from "helmet";
 import { pinoHttp } from "pino-http";
 import { docsEnabled, env } from "./config/env.js";
 import { docsRouter } from "./docs/docs-router.js";
@@ -16,8 +17,10 @@ import { apiRouter } from "./routes.js";
 import { AppError, fail, ok } from "./utils/http.js";
 
 // Some TypeScript module settings (e.g. Vercel's build) see helmet as a CJS namespace; this works in both.
-const helmet = ((helmetImport as unknown as { default?: typeof helmetImport }).default ??
-  helmetImport) as typeof helmetImport;
+type HelmetFn = (options?: HelmetOptions) => RequestHandler;
+const helmet: HelmetFn =
+  (helmetImport as unknown as { default?: HelmetFn }).default ??
+  (helmetImport as unknown as HelmetFn);
 
 const REQUEST_ID_PATTERN = /^[\w-]{8,64}$/;
 
