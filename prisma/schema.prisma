@@ -1,0 +1,1113 @@
+// =============================================================================
+// MediQ — database schema (source of truth)
+//
+// Conventions
+// - Primary keys are UUIDv7 (time-sortable, index-friendly).
+// - Every timestamp is timestamptz. Calendar dates (appointment day, leave day)
+//   are plain `date` columns interpreted in the hospital's timezone.
+// - Money is stored as integers in minor units (paise for INR) next to a
+//   currency code, so we never hit floating-point rounding and can go global.
+// - The blood bank tables (Phase 7) are at the end of this file.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../apps/api/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN // platform super admin
+  HOSPITAL_ADMIN // hospital account created by the admin
+  RECEPTIONIST
+  DOCTOR
+  PATIENT
+  BLOOD_BANK_STAFF // works for one blood bank; records donations and stock
+}
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+}
+
+enum HospitalStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  BLOCKED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum Relation {
+  SELF
+  SPOUSE
+  CHILD
+  PARENT
+  SIBLING
+  OTHER
+}
+
+enum BloodGroup {
+  A_POS
+  A_NEG
+  B_POS
+  B_NEG
+  AB_POS
+  AB_NEG
+  O_POS
+  O_NEG
+}
+
+enum OtpPurpose {
+  LOGIN
+  BLOOD_REQUEST // verifying the phone of someone asking for blood
+  BLOOD_BANK_REGISTRATION
+  BLOOD_REQUEST_RECOVERY // getting back into a request page
+}
+
+enum SlotStatus {
+  OPEN
+  BLOCKED // closed by the hospital; existing bookings stay, no new ones
+}
+
+enum ConsentType {
+  PRIVACY_POLICY
+  TERMS_OF_SERVICE
+  DONOR_ALERTS // agrees to be alerted about requests and to share a phone number after saying I can help
+}
+
+enum AppointmentSource {
+  ONLINE // booked by the patient and paid via Razorpay
+  WALK_IN // booked at the desk by a receptionist
+}
+
+enum AppointmentStatus {
+  PENDING_PAYMENT // slot is held until holdExpiresAt
+  CONFIRMED // payment captured (webhook) or cash collected; token assigned
+  CHECKED_IN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+  EXPIRED // hold timed out without payment
+}
+
+enum PaymentMethod {
+  ONLINE
+  CASH
+}
+
+enum PaymentProvider {
+  RAZORPAY
+  CASH
+  MOCK // development only: simulated online payment (PAYMENT_MODE=mock)
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum WaitlistStatus {
+  WAITING
+  NOTIFIED
+  BOOKED
+  EXPIRED
+  CANCELLED
+}
+
+enum NotificationChannel {
+  SMS
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// -----------------------------------------------------------------------------
+// Identity & auth
+// -----------------------------------------------------------------------------
+
+/// One identity table for every role.
+/// - Staff (admin, hospital admin, receptionist, doctor) log in with loginId + password.
+/// - Patients log in with phone OTP and have no password.
+model User {
+  id                 String     @id @default(uuid(7)) @db.Uuid
+  role               Role
+  status             UserStatus @default(ACTIVE)
+  name               String
+
+  /// Staff login handle, stored lower-case. Null for patients.
+  loginId            String?    @unique
+  /// bcrypt hash. Null for patients. Omitted from every query by default (see lib/prisma.ts).
+  passwordHash       String?
+  mustChangePassword Boolean    @default(false)
+  passwordChangedAt  DateTime?  @db.Timestamptz(3)
+
+  /// Patient login phone in E.164 (e.g. +919876543210). Null for staff.
+  phone              String?    @unique
+  /// Optional contact details for staff (not used for login).
+  contactPhone       String?
+  email              String?
+
+  /// Hospital this staff member belongs to (HOSPITAL_ADMIN, RECEPTIONIST, DOCTOR).
+  hospitalId         String?    @db.Uuid
+  hospital           Hospital?  @relation(fields: [hospitalId], references: [id])
+  /// Language for messages sent to this person: "en" or "hi".
+  language           String     @default("en")
+  /// Blood bank this staff member works for (BLOOD_BANK_STAFF only).
+  bloodBankId        String?    @db.Uuid
+  bloodBank          BloodBank? @relation("BloodBankStaff", fields: [bloodBankId], references: [id])
+
+  /// Bumped to invalidate every outstanding access token (password change, block).
+  tokenVersion       Int        @default(0)
+  failedLoginCount   Int        @default(0)
+  lockedUntil        DateTime?  @db.Timestamptz(3)
+  lastLoginAt        DateTime?  @db.Timestamptz(3)
+
+  createdById        String?    @db.Uuid
+  createdAt          DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @db.Timestamptz(3)
+
+  refreshTokens       RefreshToken[]
+  consents            ConsentRecord[]
+  doctorProfile       Doctor?
+  patientProfiles     PatientProfile[]
+  appointmentsBooked  Appointment[]    @relation("AppointmentBookedBy")
+  appointmentsCancelled Appointment[]  @relation("AppointmentCancelledBy")
+  cashCollected       Payment[]        @relation("PaymentCollectedBy")
+  refundsInitiated    Refund[]
+  auditLogs           AuditLog[]
+  waitlistEntries     WaitlistEntry[]
+  reviews             Review[]
+  leavesCreated       DoctorLeave[]
+  donorProfile        DonorProfile?
+  donationsRecorded   Donation[]       @relation("DonationRecordedBy")
+  donationsVoided     Donation[]       @relation("DonationVoidedBy")
+  bloodBanksVerified  BloodBank[]      @relation("BloodBankVerifiedBy")
+  stockUpdates        BloodStock[]     @relation("BloodStockUpdatedBy")
+  reviewsReported     Review[]         @relation("ReviewReportedBy")
+  reviewsModerated    Review[]         @relation("ReviewModeratedBy")
+  subscriptionsAssigned Subscription[] @relation("SubscriptionAssignedBy")
+  subscriptionPaymentsRecorded SubscriptionPayment[] @relation("SubscriptionPaymentRecordedBy")
+
+  @@index([hospitalId, role])
+  @@index([bloodBankId, role])
+}
+
+/// Opaque refresh tokens (only the SHA-256 hash is stored).
+/// Rotated on every use; a reused (already rotated) token revokes its whole family.
+model RefreshToken {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique
+  /// All tokens descending from one login share a familyId.
+  familyId     String    @db.Uuid
+  expiresAt    DateTime  @db.Timestamptz(3)
+  revokedAt    DateTime? @db.Timestamptz(3)
+  replacedById String?   @db.Uuid
+  userAgent    String?
+  ip           String?
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+/// Phone OTP challenges. The code itself is never stored, only an HMAC of it.
+model OtpCode {
+  id         String     @id @default(uuid(7)) @db.Uuid
+  phone      String
+  purpose    OtpPurpose @default(LOGIN)
+  codeHash   String
+  attempts   Int        @default(0)
+  expiresAt  DateTime   @db.Timestamptz(3)
+  consumedAt DateTime?  @db.Timestamptz(3)
+  ip         String?
+  createdAt  DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([phone, purpose, createdAt])
+}
+
+/// DPDP Act: keep a record of which policy version each user accepted and when.
+model ConsentRecord {
+  id         String      @id @default(uuid(7)) @db.Uuid
+  userId     String      @db.Uuid
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       ConsentType
+  version    String
+  ip         String?
+  userAgent  String?
+  acceptedAt DateTime    @default(now()) @db.Timestamptz(3)
+
+  @@index([userId, type])
+}
+
+// -----------------------------------------------------------------------------
+// Hospitals, departments, doctors, schedules
+// -----------------------------------------------------------------------------
+
+model Hospital {
+  id                String         @id @default(uuid(7)) @db.Uuid
+  name              String
+  /// Public URL segment: /h/{slug}
+  slug              String         @unique
+  status            HospitalStatus @default(PENDING_APPROVAL)
+  description       String?
+  logoUrl           String?
+
+  phone             String?
+  email             String?
+  emergencyPhone    String?
+
+  addressLine1      String?
+  addressLine2      String?
+  city              String?
+  state             String?
+  postalCode        String?
+  country           String         @default("IN") // ISO 3166-1 alpha-2
+  latitude          Float?
+  longitude         Float?
+  timezone          String         @default("Asia/Kolkata") // IANA tz
+  currency          String         @default("INR") // ISO 4217
+
+  /// Platform commission on each online booking, e.g. 10.00 = 10%.
+  commissionPercent Decimal        @default(0) @db.Decimal(5, 2)
+  /// Razorpay Route linked account (split payments, later phase).
+  razorpayAccountId String?
+
+  /// Refund policy for patient cancellations: a full refund when cancelled at least
+  /// this many hours before the slot, `refundPartialPercent` of the fee after that
+  /// (until online cancellation closes). Hospital- or system-initiated cancellations
+  /// are always refunded in full; no-shows are not refunded.
+  refundFullHours      Int @default(24)
+  refundPartialPercent Int @default(50)
+
+  totalBeds         Int?
+  availableBeds     Int?
+  bedsUpdatedAt     DateTime?      @db.Timestamptz(3)
+
+  approvedAt        DateTime?      @db.Timestamptz(3)
+  approvedById      String?        @db.Uuid
+  blockedAt         DateTime?      @db.Timestamptz(3)
+  blockedReason     String?
+  createdById       String?        @db.Uuid
+  createdAt         DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime       @updatedAt @db.Timestamptz(3)
+
+  users         User[]
+  departments   Department[]
+  doctors       Doctor[]
+  slots         Slot[]
+  appointments  Appointment[]
+  payments      Payment[]
+  slipTemplates SlipTemplate[]
+  reviews       Review[]
+  auditLogs     AuditLog[]
+  subscription  Subscription?
+
+  @@index([status])
+  @@index([city])
+}
+
+model Department {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  hospitalId  String   @db.Uuid
+  hospital    Hospital @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  doctors      Doctor[]
+  appointments Appointment[]
+
+  @@unique([hospitalId, name])
+}
+
+model Doctor {
+  id                 String   @id @default(uuid(7)) @db.Uuid
+  hospitalId         String   @db.Uuid
+  hospital           Hospital @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  departmentId       String   @db.Uuid
+  department         Department @relation(fields: [departmentId], references: [id])
+  /// Optional login for the doctor (role DOCTOR).
+  userId             String?  @unique @db.Uuid
+  user               User?    @relation(fields: [userId], references: [id])
+
+  name               String
+  qualification      String?
+  specialization     String?
+  registrationNumber String? // medical council registration
+  experienceYears    Int?
+  gender             Gender?
+  languages          String[]
+  bio                String?
+  photoUrl           String?
+  /// Storage key (Cloudinary public_id) so the old photo can be deleted on replace.
+  photoKey           String?
+
+  /// Consultation fee in minor units of the hospital currency (paise for INR).
+  consultationFee    Int
+  /// Used for the live-queue wait estimate.
+  avgConsultMinutes  Int      @default(10)
+  /// Unguessable token for the public live-queue page: /q/{qrToken}
+  qrToken            String   @unique
+  isActive           Boolean  @default(true)
+
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  schedules     DoctorSchedule[]
+  leaves        DoctorLeave[]
+  slots         Slot[]
+  days          DoctorDay[]
+  appointments  Appointment[]
+  waitlist      WaitlistEntry[]
+  reviews       Review[]
+
+  @@index([hospitalId, departmentId])
+}
+
+/// Recurring weekly session. A doctor can have several per day (morning/evening).
+/// Slot rows are generated from these sessions for a rolling window, minus leaves.
+model DoctorSchedule {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  doctorId        String   @db.Uuid
+  doctor          Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  /// 0 = Sunday ... 6 = Saturday
+  dayOfWeek       Int
+  /// Minutes from local midnight, e.g. 540 = 09:00
+  startMinute     Int
+  endMinute       Int
+  slotMinutes     Int      @default(15)
+  /// Patients per slot (seat numbers 1..capacityPerSlot).
+  capacityPerSlot Int      @default(1)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([doctorId, dayOfWeek])
+}
+
+/// Full-day leave range (inclusive) in the hospital's local calendar.
+model DoctorLeave {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  doctorId    String   @db.Uuid
+  doctor      Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  startDate   DateTime @db.Date
+  endDate     DateTime @db.Date
+  reason      String?
+  createdById String?  @db.Uuid
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([doctorId, startDate, endDate])
+}
+
+/// A bookable time window for one doctor, generated from DoctorSchedule for the
+/// next N days (see modules/slots). Booking locks this row (SELECT ... FOR UPDATE)
+/// and checks bookedCount < capacity. Slots with bookings are never deleted.
+model Slot {
+  id          String     @id @default(uuid(7)) @db.Uuid
+  hospitalId  String     @db.Uuid
+  hospital    Hospital   @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  doctorId    String     @db.Uuid
+  doctor      Doctor     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  /// Local calendar day in the hospital's timezone.
+  date        DateTime   @db.Date
+  startAt     DateTime   @db.Timestamptz(3)
+  endAt       DateTime   @db.Timestamptz(3)
+  capacity    Int        @default(1)
+  /// Held (pending payment) + confirmed bookings. Maintained inside the booking transaction.
+  bookedCount Int        @default(0)
+  status      SlotStatus @default(OPEN)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(3)
+
+  appointments Appointment[]
+
+  @@unique([doctorId, startAt])
+  @@index([doctorId, date])
+  @@index([hospitalId, date])
+}
+
+/// One row per doctor per working day: the token counter and live-queue state.
+/// Token numbers are assigned from lastToken inside the confirming transaction.
+model DoctorDay {
+  doctorId     String   @db.Uuid
+  doctor       Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date         DateTime @db.Date
+  /// Last token number handed out for this doctor/date.
+  lastToken    Int      @default(0)
+  /// Token currently with the doctor ("Now serving").
+  currentToken Int?
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  @@id([doctorId, date])
+}
+
+// -----------------------------------------------------------------------------
+// Patients
+// -----------------------------------------------------------------------------
+
+/// A person who can be treated: the account holder (relation SELF) or a family member.
+model PatientProfile {
+  id          String      @id @default(uuid(7)) @db.Uuid
+  /// Owning patient account. Null only for walk-ins registered without a phone.
+  userId      String?     @db.Uuid
+  user        User?       @relation(fields: [userId], references: [id])
+  relation    Relation    @default(SELF)
+  fullName    String
+  dateOfBirth DateTime?   @db.Date
+  gender      Gender?
+  bloodGroup  BloodGroup?
+  phone       String?
+  deletedAt   DateTime?   @db.Timestamptz(3)
+  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime    @updatedAt @db.Timestamptz(3)
+
+  appointments Appointment[]
+  waitlist     WaitlistEntry[]
+
+  @@index([userId])
+}
+
+// -----------------------------------------------------------------------------
+// Appointments & payments
+// -----------------------------------------------------------------------------
+
+model Appointment {
+  id                String            @id @default(uuid(7)) @db.Uuid
+  hospitalId        String            @db.Uuid
+  hospital          Hospital          @relation(fields: [hospitalId], references: [id])
+  departmentId      String            @db.Uuid
+  department        Department        @relation(fields: [departmentId], references: [id])
+  doctorId          String            @db.Uuid
+  doctor            Doctor            @relation(fields: [doctorId], references: [id])
+  slotId            String            @db.Uuid
+  slot              Slot              @relation(fields: [slotId], references: [id])
+  patientProfileId  String            @db.Uuid
+  patientProfile    PatientProfile    @relation(fields: [patientProfileId], references: [id])
+  bookedById        String            @db.Uuid
+  bookedBy          User              @relation("AppointmentBookedBy", fields: [bookedById], references: [id])
+
+  source            AppointmentSource
+  status            AppointmentStatus @default(PENDING_PAYMENT)
+
+  /// Local calendar day of the visit (hospital timezone).
+  appointmentDate   DateTime          @db.Date
+  /// Snapshot of the slot times at booking.
+  slotStart         DateTime          @db.Timestamptz(3)
+  slotEnd           DateTime          @db.Timestamptz(3)
+  /// Seat inside the slot (1..capacity). Set to NULL when the booking is
+  /// cancelled/expired so the seat can be reused. Guarded by a unique constraint.
+  seatNumber        Int?
+  /// Assigned inside the confirming transaction. Unique per doctor per day.
+  tokenNumber       Int?
+  holdExpiresAt     DateTime?         @db.Timestamptz(3)
+  /// When payment was verified and the token issued (drives reminders).
+  confirmedAt       DateTime?         @db.Timestamptz(3)
+
+  /// Snapshots at booking time (minor units).
+  feeAmount         Int
+  currency          String            @default("INR")
+  commissionPercent Decimal           @default(0) @db.Decimal(5, 2)
+
+  /// Value encoded in the patient's check-in QR.
+  checkInCode       String            @unique
+  reasonForVisit    String?
+
+  checkedInAt       DateTime?         @db.Timestamptz(3)
+  startedAt         DateTime?         @db.Timestamptz(3)
+  completedAt       DateTime?         @db.Timestamptz(3)
+  cancelledAt       DateTime?         @db.Timestamptz(3)
+  cancelledById     String?           @db.Uuid
+  cancelledBy       User?             @relation("AppointmentCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason      String?
+
+  rescheduledFromId String?           @unique @db.Uuid
+  rescheduledFrom   Appointment?      @relation("Reschedule", fields: [rescheduledFromId], references: [id])
+  rescheduledTo     Appointment?      @relation("Reschedule")
+
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @db.Timestamptz(3)
+
+  payments      Payment[]
+  review        Review?
+  notifications NotificationLog[]
+
+  // Last lines of defence against double booking:
+  @@unique([slotId, seatNumber])
+  @@unique([doctorId, appointmentDate, tokenNumber])
+  @@index([hospitalId, appointmentDate])
+  @@index([doctorId, appointmentDate, status])
+  @@index([status, holdExpiresAt])
+  @@index([bookedById])
+  @@index([patientProfileId])
+}
+
+model Payment {
+  id                String          @id @default(uuid(7)) @db.Uuid
+  appointmentId     String          @db.Uuid
+  appointment       Appointment     @relation(fields: [appointmentId], references: [id])
+  hospitalId        String          @db.Uuid
+  hospital          Hospital        @relation(fields: [hospitalId], references: [id])
+
+  method            PaymentMethod
+  provider          PaymentProvider
+  status            PaymentStatus   @default(CREATED)
+  /// Minor units.
+  amount            Int
+  currency          String          @default("INR")
+  commissionAmount  Int?
+  refundedAmount    Int             @default(0)
+
+  razorpayOrderId   String?         @unique
+  razorpayPaymentId String?         @unique
+  /// How the customer paid, as reported by the provider ("upi", "card", "netbanking", ...).
+  providerMethod    String?
+  /// Why the last attempt failed (shown to support, never to other patients).
+  failureReason     String?
+
+  /// Receptionist who collected cash.
+  collectedById     String?         @db.Uuid
+  collectedBy       User?           @relation("PaymentCollectedBy", fields: [collectedById], references: [id])
+
+  paidAt            DateTime?       @db.Timestamptz(3)
+  createdAt         DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime        @updatedAt @db.Timestamptz(3)
+
+  refunds Refund[]
+
+  @@index([appointmentId])
+  @@index([hospitalId, createdAt])
+  @@index([status])
+}
+
+model Refund {
+  id               String       @id @default(uuid(7)) @db.Uuid
+  paymentId        String       @db.Uuid
+  payment          Payment      @relation(fields: [paymentId], references: [id])
+  amount           Int
+  status           RefundStatus @default(PENDING)
+  razorpayRefundId String?      @unique
+  reason           String?
+  /// Share of the paid amount this refund returns (policy result), for display and audit.
+  percent          Int?
+  initiatedById    String?      @db.Uuid
+  initiatedBy      User?        @relation(fields: [initiatedById], references: [id])
+  /// Gateway call attempts and the last error; a job retries until it succeeds.
+  attempts         Int          @default(0)
+  error            String?
+  nextAttemptAt    DateTime?    @db.Timestamptz(3)
+  processedAt      DateTime?    @db.Timestamptz(3)
+  createdAt        DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @db.Timestamptz(3)
+
+  @@index([paymentId])
+  @@index([status, nextAttemptAt])
+}
+
+/// Every incoming payment webhook, keyed by the provider's event id so that
+/// processing is idempotent (a replayed event hits the unique constraint).
+model WebhookEvent {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  provider    PaymentProvider
+  eventId     String
+  eventType   String
+  payload     Json
+  status      WebhookStatus @default(RECEIVED)
+  error       String?
+  receivedAt  DateTime      @default(now()) @db.Timestamptz(3)
+  processedAt DateTime?     @db.Timestamptz(3)
+
+  @@unique([provider, eventId])
+  @@index([status])
+}
+
+// -----------------------------------------------------------------------------
+// Engagement
+// -----------------------------------------------------------------------------
+
+model WaitlistEntry {
+  id               String         @id @default(uuid(7)) @db.Uuid
+  doctorId         String         @db.Uuid
+  doctor           Doctor         @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date             DateTime       @db.Date
+  patientProfileId String         @db.Uuid
+  patientProfile   PatientProfile @relation(fields: [patientProfileId], references: [id])
+  userId           String         @db.Uuid
+  user             User           @relation(fields: [userId], references: [id])
+  status           WaitlistStatus @default(WAITING)
+  notifiedAt       DateTime?      @db.Timestamptz(3)
+  createdAt        DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@unique([doctorId, date, patientProfileId])
+  @@index([doctorId, date, status])
+  @@index([userId, status])
+}
+
+model Review {
+  id            String      @id @default(uuid(7)) @db.Uuid
+  appointmentId String      @unique @db.Uuid
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  hospitalId    String      @db.Uuid
+  hospital      Hospital    @relation(fields: [hospitalId], references: [id])
+  doctorId      String      @db.Uuid
+  doctor        Doctor      @relation(fields: [doctorId], references: [id])
+  userId        String      @db.Uuid
+  user          User        @relation(fields: [userId], references: [id])
+  /// 1..5
+  rating        Int
+  comment       String?
+  /// Shown to the public. Set to false when the platform admin hides the review.
+  isPublished   Boolean     @default(true)
+
+  /// A hospital can report a review it believes breaks the rules; the platform admin decides.
+  reportedAt    DateTime?   @db.Timestamptz(3)
+  reportedById  String?     @db.Uuid
+  reportedBy    User?       @relation("ReviewReportedBy", fields: [reportedById], references: [id])
+  reportReason  String?
+  hiddenAt      DateTime?   @db.Timestamptz(3)
+  hiddenReason  String?
+  moderatedById String?     @db.Uuid
+  moderatedBy   User?       @relation("ReviewModeratedBy", fields: [moderatedById], references: [id])
+
+  createdAt     DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime    @updatedAt @db.Timestamptz(3)
+
+  @@index([doctorId, isPublished])
+  @@index([hospitalId, isPublished])
+  @@index([reportedAt])
+}
+
+/// Doctor-slip layout for pre-printed paper: positions in millimetres plus a
+/// printer calibration offset. Only data is printed, never the background.
+model SlipTemplate {
+  id                 String   @id @default(uuid(7)) @db.Uuid
+  hospitalId         String   @db.Uuid
+  hospital           Hospital @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  name               String
+  paperWidthMm       Float
+  paperHeightMm      Float
+  offsetXMm          Float    @default(0)
+  offsetYMm          Float    @default(0)
+  /// [{ key: "patientName", xMm, yMm, fontSizePt, bold, maxWidthMm }, ...]
+  fields             Json
+  /// Scan of the blank paper, shown in the editor only (never printed).
+  backgroundImageUrl String?
+  /// Storage key of that scan, so a replaced or deleted scan can be removed from storage.
+  backgroundKey      String?
+  isDefault          Boolean  @default(false)
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([hospitalId])
+}
+
+// -----------------------------------------------------------------------------
+// Operations
+// -----------------------------------------------------------------------------
+
+/// Who changed what. Written in the same transaction as the change it describes.
+model AuditLog {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  actorId     String?   @db.Uuid
+  actor       User?     @relation(fields: [actorId], references: [id])
+  actorRole   Role?
+  /// Dotted verb, e.g. "auth.password_changed", "appointment.cancelled"
+  action      String
+  entityType  String
+  entityId    String?
+  /// Set when the change belongs to a hospital, so hospital admins can see their own trail.
+  hospitalId  String?   @db.Uuid
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
+  before      Json?
+  after       Json?
+  metadata    Json?
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([hospitalId, createdAt])
+  @@index([createdAt])
+}
+
+/// Outbox for messages. Rows are written in the same transaction as the event that
+/// causes them (booking confirmed, cancelled, ...), so a message is never lost; a
+/// dispatcher sends them and retries failures. The unique key makes every message
+/// (e.g. "reminder for appointment X") exactly-once, however often a job runs.
+model NotificationLog {
+  id                String              @id @default(uuid(7)) @db.Uuid
+  userId            String?             @db.Uuid
+  appointmentId     String?             @db.Uuid
+  appointment       Appointment?        @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  /// Ties messages that belong together outside an appointment (a blood request, a donation) so each
+  /// recipient gets each message once: "blood-request:<id>".
+  groupKey          String?
+  channel           NotificationChannel
+  provider          String
+  to                String
+  template          String
+  /// Values for the message template (names, times, amounts). Rendered at send time.
+  templateVars      Json?
+  /// Language of the message text ("en" or "hi"): the recipient's choice when it was queued.
+  language          String              @default("en")
+  status            NotificationStatus  @default(QUEUED)
+  providerMessageId String?
+  attempts          Int                 @default(0)
+  /// Doubles as a lease: a claimed row is not picked up again until this passes.
+  nextAttemptAt     DateTime?           @db.Timestamptz(3)
+  error             String?
+  sentAt            DateTime?           @db.Timestamptz(3)
+  createdAt         DateTime            @default(now()) @db.Timestamptz(3)
+
+  @@unique([appointmentId, template, channel])
+  @@unique([groupKey, template, channel, to])
+  @@index([userId])
+  @@index([createdAt])
+  @@index([status, nextAttemptAt])
+}
+
+// -----------------------------------------------------------------------------
+// Blood bank module (Phase 7)
+//
+// MediQ only connects people: it never holds, sells or vouches for blood. Donations
+// are recorded only by blood bank staff. There are deliberately no coupons or
+// vouchers: a donation is a dated record, nothing is issued or redeemed.
+// -----------------------------------------------------------------------------
+
+enum BloodBankStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  REJECTED
+  BLOCKED
+}
+
+enum BloodRequestStatus {
+  OPEN
+  FULFILLED
+  CANCELLED
+  EXPIRED
+}
+
+enum BloodUrgency {
+  EMERGENCY
+  URGENT
+}
+
+enum BloodResponseKind {
+  CAN_HELP
+  CANNOT
+}
+
+model BloodBank {
+  id                String          @id @default(uuid(7)) @db.Uuid
+  name              String
+  /// Upper-cased and trimmed. Checked by the platform admin before the bank is listed.
+  licenseNumber     String          @unique
+  licenseAuthority  String?
+  licenseValidUntil DateTime?       @db.Date
+  status            BloodBankStatus @default(PENDING_VERIFICATION)
+
+  /// E.164. Verified with an OTP at registration; alerts about nearby requests go here.
+  phone             String
+  email             String?
+  addressLine1      String
+  city              String
+  state             String?
+  postalCode        String?
+  country           String          @default("IN")
+  latitude          Float?
+  longitude         Float?
+  is24x7            Boolean         @default(false)
+  operatingHours    String?
+
+  verifiedAt        DateTime?       @db.Timestamptz(3)
+  verifiedById      String?         @db.Uuid
+  verifiedBy        User?           @relation("BloodBankVerifiedBy", fields: [verifiedById], references: [id])
+  rejectedReason    String?
+  blockedAt         DateTime?       @db.Timestamptz(3)
+  blockedReason     String?
+
+  createdAt         DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime        @updatedAt @db.Timestamptz(3)
+
+  staff     User[]                  @relation("BloodBankStaff")
+  stock     BloodStock[]
+  donations Donation[]
+  alerts    BloodRequestAlert[]
+  responses BloodRequestResponse[]
+
+  @@index([status, city])
+}
+
+/// Units on the shelf per blood group, as last reported by the bank staff.
+model BloodStock {
+  id          String     @id @default(uuid(7)) @db.Uuid
+  bloodBankId String     @db.Uuid
+  bloodBank   BloodBank  @relation(fields: [bloodBankId], references: [id], onDelete: Cascade)
+  bloodGroup  BloodGroup
+  units       Int
+  updatedById String?    @db.Uuid
+  updatedBy   User?      @relation("BloodStockUpdatedBy", fields: [updatedById], references: [id])
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(3)
+
+  @@unique([bloodBankId, bloodGroup])
+}
+
+/// A patient account that has chosen to be a donor. Phone and name come from the account.
+model DonorProfile {
+  id                   String     @id @default(uuid(7)) @db.Uuid
+  userId               String     @unique @db.Uuid
+  user                 User       @relation(fields: [userId], references: [id])
+  /// As the donor says it; the bank corrects it with each donation.
+  bloodGroup           BloodGroup
+  gender               Gender
+  dateOfBirth          DateTime   @db.Date
+  city                 String
+  /// Rounded to about 1 km: enough to find requests nearby, not enough to find the person.
+  latitude             Float?
+  longitude            Float?
+  isAvailable          Boolean    @default(true)
+  /// Of the last donation that was not voided; drives the waiting period.
+  lastDonationAt       DateTime?  @db.Timestamptz(3)
+  alertsConsentAt      DateTime   @db.Timestamptz(3)
+  alertsConsentVersion String
+  createdAt            DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime   @updatedAt @db.Timestamptz(3)
+
+  donations Donation[]
+  alerts    BloodRequestAlert[]
+  responses BloodRequestResponse[]
+
+  @@index([bloodGroup, isAvailable])
+}
+
+/// Created only by blood bank staff. Nothing is issued to the donor: it is a record.
+model Donation {
+  id           String        @id @default(uuid(7)) @db.Uuid
+  /// Kept (without a link to a person) if the donor erases their account.
+  donorId      String?       @db.Uuid
+  donor        DonorProfile? @relation(fields: [donorId], references: [id], onDelete: SetNull)
+  bloodBankId  String        @db.Uuid
+  bloodBank    BloodBank     @relation(fields: [bloodBankId], references: [id])
+  recordedById String        @db.Uuid
+  recordedBy   User          @relation("DonationRecordedBy", fields: [recordedById], references: [id])
+  donatedAt    DateTime      @default(now()) @db.Timestamptz(3)
+  /// Confirmed by the bank, not just claimed by the donor.
+  bloodGroup   BloodGroup
+  volumeMl     Int
+
+  /// A mistaken record can be voided (with a reason) so the donor is not locked out of donating.
+  voidedAt     DateTime?     @db.Timestamptz(3)
+  voidedById   String?       @db.Uuid
+  voidedBy     User?         @relation("DonationVoidedBy", fields: [voidedById], references: [id])
+  voidReason   String?
+  createdAt    DateTime      @default(now()) @db.Timestamptz(3)
+
+  @@index([donorId, donatedAt])
+  @@index([bloodBankId, donatedAt])
+}
+
+/// An emergency request for blood, made by anyone with a verified phone number.
+model BloodRequest {
+  id               String             @id @default(uuid(7)) @db.Uuid
+  requesterPhone   String
+  requesterName    String
+  /// Hash of the secret the requester browser keeps: the only way back to the request page.
+  requesterKeyHash String
+  bloodGroup       BloodGroup
+  unitsNeeded      Int
+  urgency          BloodUrgency
+  /// The hospital where the patient is.
+  hospitalName     String
+  city             String
+  latitude         Float?
+  longitude        Float?
+  radiusKm         Int                @default(25)
+  note             String?
+  status           BloodRequestStatus @default(OPEN)
+  expiresAt        DateTime           @db.Timestamptz(3)
+  closedAt         DateTime?          @db.Timestamptz(3)
+  createdIp        String?
+  alertedDonors    Int                @default(0)
+  alertedBanks     Int                @default(0)
+  createdAt        DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime           @updatedAt @db.Timestamptz(3)
+
+  alerts    BloodRequestAlert[]
+  responses BloodRequestResponse[]
+
+  @@index([status, expiresAt])
+  @@index([requesterPhone, createdAt])
+  @@index([bloodGroup, status])
+}
+
+/// Who was told about a request. A donor or bank can see and answer only requests they were alerted to.
+model BloodRequestAlert {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  requestId   String        @db.Uuid
+  request     BloodRequest  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  donorId     String?       @db.Uuid
+  donor       DonorProfile? @relation(fields: [donorId], references: [id], onDelete: Cascade)
+  bloodBankId String?       @db.Uuid
+  bloodBank   BloodBank?    @relation(fields: [bloodBankId], references: [id], onDelete: Cascade)
+  distanceKm  Float?
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+
+  @@unique([requestId, donorId])
+  @@unique([requestId, bloodBankId])
+  @@index([donorId, createdAt])
+  @@index([bloodBankId, createdAt])
+}
+
+/// "I can help". The requester sees a donor phone number only while a CAN_HELP response stands.
+model BloodRequestResponse {
+  id          String            @id @default(uuid(7)) @db.Uuid
+  requestId   String            @db.Uuid
+  request     BloodRequest      @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  donorId     String?           @db.Uuid
+  donor       DonorProfile?     @relation(fields: [donorId], references: [id], onDelete: Cascade)
+  bloodBankId String?           @db.Uuid
+  bloodBank   BloodBank?        @relation(fields: [bloodBankId], references: [id], onDelete: Cascade)
+  response    BloodResponseKind
+  createdAt   DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime          @updatedAt @db.Timestamptz(3)
+
+  @@unique([requestId, donorId])
+  @@unique([requestId, bloodBankId])
+  @@index([requestId, response])
+}
+
+// -----------------------------------------------------------------------------
+// Subscription plans for hospitals (Phase 8)
+//
+// The platform admin assigns a plan to each hospital and records payments received
+// offline (bank transfer, UPI, cash). Nothing here talks to a payment gateway.
+// -----------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  SUSPENDED // stopped by the admin
+  CANCELLED
+}
+
+enum SubscriptionPaymentMethod {
+  BANK_TRANSFER
+  UPI
+  CASH
+  CHEQUE
+  OTHER
+}
+
+model Plan {
+  id                 String   @id @default(uuid(7)) @db.Uuid
+  /// Short stable name used in settings and scripts, lower case: "pilot", "standard".
+  code               String   @unique
+  name               String
+  description        String?
+  /// Minor units per month (paise). 0 for a free plan.
+  priceMonthly       Int      @default(0)
+  currency           String   @default("INR")
+  /// Limits. Null means unlimited.
+  maxDoctors         Int?
+  maxStaff           Int?
+  maxMonthlyBookings Int?
+  /// Features beyond the essentials (booking, desk, queue are always on).
+  analytics          Boolean  @default(true)
+  slipPrinting       Boolean  @default(true)
+  isActive           Boolean  @default(true)
+  sortOrder          Int      @default(0)
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  subscriptions Subscription[]
+}
+
+/// One per hospital. The effective state also depends on the dates (see subscription-rules.ts).
+model Subscription {
+  id                 String             @id @default(uuid(7)) @db.Uuid
+  hospitalId         String             @unique @db.Uuid
+  hospital           Hospital           @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  planId             String             @db.Uuid
+  plan               Plan               @relation(fields: [planId], references: [id])
+  status             SubscriptionStatus @default(ACTIVE)
+  trialEndsAt        DateTime?          @db.Timestamptz(3)
+  currentPeriodStart DateTime?          @db.Timestamptz(3)
+  /// Null means the subscription does not expire (the free pilot plan).
+  currentPeriodEnd   DateTime?          @db.Timestamptz(3)
+  notes              String?
+  assignedById       String?            @db.Uuid
+  assignedBy         User?              @relation("SubscriptionAssignedBy", fields: [assignedById], references: [id])
+  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(3)
+
+  payments SubscriptionPayment[]
+
+  @@index([planId])
+  @@index([status, currentPeriodEnd])
+}
+
+/// A payment the admin received offline and recorded; it extends the paid period.
+model SubscriptionPayment {
+  id             String                    @id @default(uuid(7)) @db.Uuid
+  subscriptionId String                    @db.Uuid
+  subscription   Subscription              @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  /// Minor units.
+  amount         Int
+  currency       String                    @default("INR")
+  method         SubscriptionPaymentMethod
+  /// Bank reference, UPI transaction id, cheque number...
+  reference      String?
+  paidAt         DateTime                  @db.Timestamptz(3)
+  periodStart    DateTime                  @db.Timestamptz(3)
+  periodEnd      DateTime                  @db.Timestamptz(3)
+  note           String?
+  recordedById   String                    @db.Uuid
+  recordedBy     User                      @relation("SubscriptionPaymentRecordedBy", fields: [recordedById], references: [id])
+  createdAt      DateTime                  @default(now()) @db.Timestamptz(3)
+
+  @@index([subscriptionId, paidAt])
+}

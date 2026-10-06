@@ -1,0 +1,24 @@
+      <h2>Blood donors, requests and blood banks</h2>
+      <ul>
+        <li>
+          MediQ only connects people who need blood with donors and blood banks. We do not provide, test, store, sell
+          or guarantee blood, and we give no medical advice.
+        </li>
+        <li>
+          Whether blood is available, and whether it is safe, is the responsibility of the blood bank and the hospital
+          that uses it. A blood bank is responsible for keeping its licence valid, for screening donors and for the
+          stock figures it reports.
+        </li>
+        <li>
+          Blood must never be paid for through MediQ, and you must not ask anyone to pay you for it. Do not make a
+          request unless a patient really needs blood.
+        </li>
+        <li>
+          A donor chooses whether to help and may stop at any time. Donating is the donor&apos;s own decision, made after
+          the blood bank has screened them.
+        </li>
+        <li>
+          We may stop a request, block a blood bank or remove a donor who misuses the service.
+        </li>
+      </ul>
+

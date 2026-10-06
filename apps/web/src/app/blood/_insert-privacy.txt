@@ -1,0 +1,33 @@
+      <h2>Blood donors, blood requests and blood banks</h2>
+      <p>
+        MediQ helps people who need blood find donors and blood banks nearby. MediQ only connects people. We do not
+        collect, store, test or sell blood, and we are not a blood bank.
+      </p>
+      <ul>
+        <li>
+          <strong>Donors</strong> who choose to register give their blood group, gender, date of birth, city and, if
+          they allow it, their location (saved only to about 1 km). We use these to find requests near them, to keep
+          them out of requests while they must wait between donations, and to show a blood bank whether they may
+          donate. A blood bank records each donation (date, the blood group it confirmed and the amount). A donation is
+          only a record: nothing is issued to the donor.
+        </li>
+        <li>
+          A donor agrees, when registering, to be alerted by SMS about requests near them. A donor&apos;s phone number
+          is shown to the person who asked for blood <strong>only</strong> if the donor taps &quot;I can help&quot;, and
+          only while that request is open. Donors can pause alerts or stop being a donor at any time.
+        </li>
+        <li>
+          <strong>People asking for blood</strong> give their name, phone number (checked with a code), the hospital, city
+          and an optional note. The donors and blood banks we alert see the hospital, city, number of units, the note
+          and the first name, never the phone number. A request closes by itself after a day. Its name, phone number and
+          note are removed 90 days after it closed.
+        </li>
+        <li>
+          <strong>Blood banks</strong> register with their licence number, address and phone number, which we check before
+          listing them. The licence number, name, address, phone and the stock they report are shown publicly.
+        </li>
+        <li>
+          We keep records of who recorded or changed what (for example a donation or a stock update) in an audit log.
+        </li>
+      </ul>
+

@@ -1,0 +1,85 @@
+# Daily encrypted off-site database backup. Runs at 03:00 IST (21:30 UTC) and on demand.
+# Needs these repository secrets (Settings > Secrets and variables > Actions):
+#   BACKUP_DATABASE_URL   direct (non-pooled) read-capable connection string
+#   BACKUP_PASSPHRASE     long random passphrase; store a copy in your password manager,
+#                         without it the backups cannot be opened
+#   BACKUP_S3_BUCKET      bucket name (private, versioned, with a lifecycle rule: docs/BACKUP-RESTORE.md)
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   a key allowed to write to that bucket only
+# Optional: BACKUP_S3_ENDPOINT (for Cloudflare R2 or other S3-compatible storage), AWS_DEFAULT_REGION.
+name: Daily database backup
+
+on:
+  schedule:
+    - cron: "30 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+
+      - run: pnpm install --frozen-lockfile --filter api...
+
+      - name: Dump and verify
+        run: pnpm --filter api db:backup
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_DIR: ${{ runner.temp }}/backups
+
+      - name: Encrypt
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/backups"
+          file=$(ls -1 mediq-*.dump | tail -n 1)
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:BACKUP_PASSPHRASE -in "$file" -out "$file.enc"
+          sha256sum "$file.enc" > "$file.enc.sha256"
+          echo "BACKUP_FILE=$file.enc" >> "$GITHUB_ENV"
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          RUNNER_TEMP: ${{ runner.temp }}
+
+      - name: Upload off-site
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/backups"
+          endpoint=()
+          if [ -n "${BACKUP_S3_ENDPOINT:-}" ]; then endpoint=(--endpoint-url "$BACKUP_S3_ENDPOINT"); fi
+          aws "${endpoint[@]}" s3 cp "$BACKUP_FILE" "s3://$BACKUP_S3_BUCKET/mediq/$BACKUP_FILE" --only-show-errors
+          aws "${endpoint[@]}" s3 cp "$BACKUP_FILE.sha256" "s3://$BACKUP_S3_BUCKET/mediq/$BACKUP_FILE.sha256" --only-show-errors
+          # Prove it arrived and has the same size.
+          local_size=$(stat -c %s "$BACKUP_FILE")
+          remote_size=$(aws "${endpoint[@]}" s3api head-object --bucket "$BACKUP_S3_BUCKET" --key "mediq/$BACKUP_FILE" --query ContentLength --output text)
+          [ "$local_size" = "$remote_size" ] || { echo "Upload size mismatch: $local_size vs $remote_size"; exit 1; }
+          echo "Uploaded $BACKUP_FILE ($remote_size bytes)"
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          BACKUP_S3_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+          BACKUP_S3_ENDPOINT: ${{ secrets.BACKUP_S3_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'ap-south-1' }}
