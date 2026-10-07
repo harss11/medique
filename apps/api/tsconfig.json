@@ -9,6 +9,7 @@
     "src",
     "prisma.config.ts",
     "tsup.config.ts",
+    "tsup.vercel.config.ts",
     "vitest.config.ts",
     "vitest.integration.config.ts",
     "test"
