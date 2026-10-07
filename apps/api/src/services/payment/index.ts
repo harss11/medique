@@ -72,7 +72,7 @@ export class RazorpayGateway implements PaymentGateway {
     body: unknown,
     extraHeaders: Record<string, string> = {},
   ): Promise<T> {
-    let res: Response;
+    let res: Awaited<ReturnType<typeof fetch>>;
     try {
       res = await this.fetchImpl(`${RAZORPAY_API}${path}`, {
         method: "POST",

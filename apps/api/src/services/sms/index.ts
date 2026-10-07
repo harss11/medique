@@ -101,7 +101,7 @@ export class Msg91Provider implements SmsProvider {
         v.length > MSG91_MAX_VAR ? `${v.slice(0, MSG91_MAX_VAR - 1)}…` : v,
       ]),
     );
-    let res: Response;
+    let res: Awaited<ReturnType<typeof fetch>>;
     try {
       res = await this.fetchImpl(MSG91_FLOW_URL, {
         method: "POST",
@@ -155,7 +155,7 @@ export class TwilioProvider implements SmsProvider {
       From: whatsapp ? `whatsapp:${this.whatsappFrom}` : this.smsFrom,
       Body: message.body,
     });
-    let res: Response;
+    let res: Awaited<ReturnType<typeof fetch>>;
     try {
       res = await this.fetchImpl(
         `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(this.accountSid)}/Messages.json`,
