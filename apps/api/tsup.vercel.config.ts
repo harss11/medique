@@ -1,10 +1,10 @@
 import { defineConfig } from "tsup";
 
-// Bundles the API into api/index.js, the serverless function Vercel runs.
+// Bundles the API into dist/vercel.js, which api/index.js re-exports as the serverless function.
 // Same bundling as tsup.config.ts, so Vercel never runs its own type check.
 export default defineConfig({
-  entry: { index: "src/vercel.ts" },
-  outDir: "api",
+  entry: { vercel: "src/vercel.ts" },
+  outDir: "dist",
   format: ["esm"],
   platform: "node",
   target: "node22",
