@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "buildCommand": "tsup --config tsup.vercel.config.ts",
+  "buildCommand": "tsup --config tsup.vercel.config.ts && mkdir -p public && echo ok > public/index.txt",
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }]
 }
